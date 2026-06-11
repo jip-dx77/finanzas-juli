@@ -1,242 +1,443 @@
 import os
-import re
-import base64
 import json
-from datetime import datetime
-import anthropic
+import base64
+import re
+from datetime import datetime, date
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from supabase import create_client, Client
+import anthropic
 
-# ── Clientes ──────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
-SUPABASE_URL    = os.environ["SUPABASE_URL"]
-SUPABASE_KEY    = os.environ["SUPABASE_KEY"]
-ANTHROPIC_KEY   = os.environ["ANTHROPIC_API_KEY"]
-MI_CHAT_ID      = int(os.environ["MI_CHAT_ID"])   # tu ID personal de Telegram
+load_dotenv()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+MI_CHAT_ID = int(os.getenv("MI_CHAT_ID"))
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-CATEGORIAS = [
-    "super", "comida", "combustible", "servicios", "tarjeta",
-    "salud", "ropa", "ocio", "transporte", "suscripcion", "otros"
-]
+CATEGORIAS = ["super", "comida", "combustible", "servicios", "tarjeta", "salud", "ropa", "ocio", "transporte", "suscripcion", "otros"]
 
-# ── Seguridad: solo vos podés usar el bot ────────────────────────────────────
+
 def solo_yo(func):
-    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id != MI_CHAT_ID:
-            await update.message.reply_text("No autorizado.")
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_chat.id != MI_CHAT_ID:
             return
-        return await func(update, ctx)
+        return await func(update, context)
     return wrapper
 
-# ── Guardar gasto en Supabase ─────────────────────────────────────────────────
-def guardar_gasto(concepto: str, monto: float, categoria: str, fuente: str = "telegram"):
-    hoy = datetime.now()
-    data = {
-        "concepto":  concepto,
-        "monto":     monto,
-        "categoria": categoria,
-        "fecha":     hoy.date().isoformat(),
-        "mes":       hoy.month,
-        "anio":      hoy.year,
-        "fuente":    fuente,
+
+def hoy():
+    return date.today()
+
+
+def mes_anio_de_fecha(fecha_str=None):
+    if fecha_str:
+        d = datetime.strptime(fecha_str, "%Y-%m-%d")
+        return d.month, d.year
+    h = hoy()
+    return h.month, h.year
+
+
+def formatear_monto(m):
+    return f"${int(float(m)):,}".replace(",", ".")
+
+
+async def parsear_mensaje(texto: str) -> dict:
+    hoy_str = hoy().isoformat()
+    mes, anio = mes_anio_de_fecha()
+
+    prompt = f"""Sos un asistente financiero personal argentino. Hoy es {hoy_str}, mes {mes}, año {anio}.
+
+El usuario te mandó: "{texto}"
+
+Respondé SOLO con un JSON válido (sin markdown, sin texto extra):
+
+{{
+  "intent": "gasto" | "ingreso" | "resumen" | "resumen_ingresos" | "metas" | "cuotas" | "ayuda" | "desconocido",
+  "datos": {{
+    "concepto": "texto descriptivo",
+    "monto": número o null,
+    "categoria": una de ["super","comida","combustible","servicios","tarjeta","salud","ropa","ocio","transporte","suscripcion","otros"] o null,
+    "tipo": "salario" | "aguinaldo" | "extra" (solo para ingresos),
+    "fecha": "YYYY-MM-DD" o null
+  }},
+  "confirmacion_necesaria": true | false,
+  "pregunta": "pregunta al usuario" | null
+}}
+
+Reglas de categorización:
+- super/supermercado/almacén/mercado/disco/carrefour/dia/coto/walmart → "super"
+- comida/delivery/restaurante/café/almuerzo/cena/desayuno/pizza/sushi/pedidos ya/rappi → "comida"
+- nafta/gasoil/combustible/shell/ypf/axion/carga combustible → "combustible"
+- luz/agua/gas/internet/wifi/servicio/factura/edesur/metrogas → "servicios"
+- tarjeta/resumen/visa/mastercard/cuota → "tarjeta"
+- farmacia/médico/doctor/salud/medicamento/turno médico → "salud"
+- ropa/zapatillas/indumentaria/zara/h&m/calzado → "ropa"
+- cine/teatro/streaming/entretenimiento/salida/bar/boliche → "ocio"
+- uber/taxi/remis/colectivo/tren/subte/cabify → "transporte"
+- netflix/spotify/disney/suscripción/app/plataforma → "suscripcion"
+
+Para ingresos detectar palabras como: cobré, sueldo, salario, ingresé, me pagaron, aguinaldo, plus, bono.
+
+Si falta el monto → confirmacion_necesaria: true, pregunta: "¿Cuánto fue el monto?"
+Si el intent es ambiguo entre gasto e ingreso → pedí aclaración.
+Siempre inferí la categoría aunque no sea explícita, usando el contexto."""
+
+    response = claude.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    raw = response.content[0].text.strip()
+    raw = re.sub(r"^```json\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    return json.loads(raw)
+
+
+async def registrar_gasto(datos: dict) -> dict:
+    fecha = datos.get("fecha") or hoy().isoformat()
+    mes, anio = mes_anio_de_fecha(fecha)
+    row = {
+        "concepto": datos["concepto"],
+        "monto": datos["monto"],
+        "categoria": datos.get("categoria") or "otros",
+        "fecha": fecha,
+        "mes": mes,
+        "anio": anio,
+        "fuente": "bot",
     }
-    resultado = supabase.table("gastos").insert(data).execute()
-    return resultado.data[0] if resultado.data else None
+    result = supabase.table("gastos").insert(row).execute()
+    return result.data[0] if result.data else row
 
-# ── Parsear texto libre: "carne 25000" / "super 12500 comida" ─────────────────
-def parsear_texto(texto: str):
-    texto = texto.strip().lower()
-    # busca número (con o sin puntos/comas)
-    match = re.search(r"([\d\.,]+)", texto)
-    if not match:
-        return None, None, None
-    monto_str = match.group(1).replace(".", "").replace(",", "")
-    monto = float(monto_str)
-    # resto del texto = concepto
-    concepto = re.sub(r"[\d\.,]+", "", texto).strip()
-    concepto = re.sub(r"\s+", " ", concepto).strip()
-    # intentar detectar categoría
-    categoria = "otros"
-    for cat in CATEGORIAS:
-        if cat in texto:
-            categoria = cat
-            break
-    if not concepto:
-        concepto = categoria
-    return concepto.title(), monto, categoria
 
-# ── Parsear foto de ticket con Claude Vision ──────────────────────────────────
-async def parsear_foto(foto_bytes: bytes) -> dict:
-    img_b64 = base64.standard_b64encode(foto_bytes).decode("utf-8")
-    prompt = """Analizá este ticket/factura y devolvé SOLO un JSON válido con:
-{
-  "concepto": "nombre del negocio o descripción breve",
-  "monto": número total en pesos (solo el número, sin $ ni puntos),
-  "categoria": una de: super, comida, combustible, servicios, tarjeta, salud, ropa, ocio, transporte, suscripcion, otros,
-  "items": ["item1", "item2"] (opcional, los principales productos)
-}
-Si no podés leer el monto, poné 0. No incluyas nada más que el JSON."""
-    
-    mensaje = claude.messages.create(
-        model="claude-opus-4-6",
-        max_tokens=300,
+async def registrar_ingreso(datos: dict) -> dict:
+    fecha = datos.get("fecha") or hoy().isoformat()
+    mes, anio = mes_anio_de_fecha(fecha)
+    row = {
+        "concepto": datos.get("concepto") or datos.get("tipo") or "Ingreso",
+        "monto": datos["monto"],
+        "tipo": datos.get("tipo") or "extra",
+        "fecha": fecha,
+        "mes": mes,
+        "anio": anio,
+    }
+    result = supabase.table("ingresos").insert(row).execute()
+    return result.data[0] if result.data else row
+
+
+MESES = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+         "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+
+
+async def obtener_resumen_gastos() -> str:
+    mes, anio = mes_anio_de_fecha()
+    result = supabase.table("gastos").select("categoria, monto").eq("mes", mes).eq("anio", anio).execute()
+
+    if not result.data:
+        return "No hay gastos registrados este mes."
+
+    totales = {}
+    total = 0
+    for row in result.data:
+        cat = row["categoria"]
+        monto = float(row["monto"])
+        totales[cat] = totales.get(cat, 0) + monto
+        total += monto
+
+    texto = f"📊 *Gastos {MESES[mes]} {anio}*\n\n"
+    for cat, monto in sorted(totales.items(), key=lambda x: x[1], reverse=True):
+        pct = monto / total * 100
+        texto += f"• {cat.capitalize()}: {formatear_monto(monto)} ({pct:.0f}%)\n"
+    texto += f"\n💸 *Total: {formatear_monto(total)}*"
+    return texto
+
+
+async def obtener_resumen_ingresos() -> str:
+    mes, anio = mes_anio_de_fecha()
+    result = supabase.table("ingresos").select("concepto, monto, tipo").eq("mes", mes).eq("anio", anio).execute()
+
+    if not result.data:
+        return "No hay ingresos registrados este mes."
+
+    total = sum(float(r["monto"]) for r in result.data)
+    texto = f"💰 *Ingresos {MESES[mes]} {anio}*\n\n"
+    for r in result.data:
+        texto += f"• {r['concepto']}: {formatear_monto(r['monto'])}\n"
+    texto += f"\n✅ *Total: {formatear_monto(total)}*"
+    return texto
+
+
+async def obtener_metas() -> str:
+    result = supabase.table("metas").select("*").eq("activa", True).execute()
+
+    if not result.data:
+        return "No tenés metas activas."
+
+    texto = "🎯 *Metas de ahorro*\n\n"
+    for m in result.data:
+        actual = float(m["monto_actual"])
+        objetivo = float(m["monto_objetivo"])
+        pct = (actual / objetivo * 100) if objetivo > 0 else 0
+        bloques = int(pct / 10)
+        barra = "█" * bloques + "░" * (10 - bloques)
+        texto += f"*{m['icono']} {m['nombre']}*\n"
+        texto += f"`{barra}` {pct:.0f}%\n"
+        texto += f"{formatear_monto(actual)} / {formatear_monto(objetivo)}\n"
+        if m.get("fecha_limite"):
+            texto += f"📅 Límite: {m['fecha_limite']}\n"
+        texto += "\n"
+    return texto.strip()
+
+
+async def obtener_cuotas() -> str:
+    result = supabase.table("cuotas").select("*").eq("activa", True).execute()
+
+    if not result.data:
+        return "No tenés cuotas activas."
+
+    texto = "💳 *Cuotas activas*\n\n"
+    for c in result.data:
+        restantes = c["cuotas_totales"] - c["cuotas_pagadas"]
+        total_restante = restantes * float(c["monto_cuota"])
+        texto += f"• *{c['nombre']}*\n"
+        texto += f"  {formatear_monto(c['monto_cuota'])}/mes · {restantes} cuotas restantes\n"
+        texto += f"  Pendiente: {formatear_monto(total_restante)}\n"
+        if c.get("tarjeta") and c["tarjeta"] != "Sin tarjeta":
+            texto += f"  Tarjeta: {c['tarjeta']}\n"
+        texto += "\n"
+    return texto.strip()
+
+
+async def analizar_foto(image_data: bytes) -> list:
+    b64 = base64.standard_b64encode(image_data).decode("utf-8")
+
+    prompt = f"""Analizá este ticket/factura. Respondé SOLO con un JSON válido:
+
+{{
+  "gastos": [
+    {{
+      "concepto": "descripción clara del gasto",
+      "monto": número,
+      "categoria": una de {CATEGORIAS}
+    }}
+  ]
+}}
+
+Reglas:
+- Si es un ticket de supermercado con muchos items → un solo gasto con concepto "Supermercado [nombre del local]" y categoria "super".
+- Si hay servicios o productos claramente distintos → listá cada uno por separado.
+- Usá el nombre del local, tipo de productos y contexto para elegir la categoría correcta.
+- El monto debe ser el total del ticket o el precio de cada item.
+- No incluyas propinas ni items con monto 0."""
+
+    response = claude.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1000,
         messages=[{
             "role": "user",
             "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
                 {"type": "text", "text": prompt}
             ]
         }]
     )
-    texto = mensaje.content[0].text.strip()
-    # limpiar posibles ```json ... ```
-    texto = re.sub(r"```json|```", "", texto).strip()
-    return json.loads(texto)
 
-# ── /start ────────────────────────────────────────────────────────────────────
-@solo_yo
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Hola! Soy tu bot de finanzas 💰\n\n"
-        "Podés:\n"
-        "• Escribir: *carne 25000* o *super 12500 comida*\n"
-        "• Mandar una *foto de ticket* y lo cargo automático\n"
-        "• /resumen — ver resumen del mes\n"
-        "• /ayuda — ver todos los comandos",
-        parse_mode="Markdown"
-    )
+    raw = response.content[0].text.strip()
+    raw = re.sub(r"^```json\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    data = json.loads(raw)
+    return data.get("gastos", [])
 
-# ── /resumen ──────────────────────────────────────────────────────────────────
-@solo_yo
-async def cmd_resumen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    hoy = datetime.now()
-    res = supabase.table("gastos")\
-        .select("categoria, monto")\
-        .eq("mes", hoy.month)\
-        .eq("anio", hoy.year)\
-        .execute()
-    
-    if not res.data:
-        await update.message.reply_text("No hay gastos registrados este mes todavía.")
-        return
-    
-    totales = {}
-    for g in res.data:
-        cat = g["categoria"]
-        totales[cat] = totales.get(cat, 0) + g["monto"]
-    
-    total = sum(totales.values())
-    lineas = [f"📊 *Resumen {hoy.strftime('%B %Y')}*\n"]
-    for cat, monto in sorted(totales.items(), key=lambda x: -x[1]):
-        pct = (monto / total * 100) if total else 0
-        lineas.append(f"• {cat.title()}: ${monto:,.0f} ({pct:.0f}%)")
-    lineas.append(f"\n💰 *Total: ${total:,.0f}*")
-    
-    await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
 
-# ── /ayuda ────────────────────────────────────────────────────────────────────
-@solo_yo
-async def cmd_ayuda(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "*Comandos disponibles:*\n\n"
-        "/start — bienvenida\n"
-        "/resumen — gastos del mes actual\n"
-        "/ayuda — esta ayuda\n\n"
-        "*Cargar gasto rápido:*\n"
-        "• `carne 25000`\n"
-        "• `nafta 18000 combustible`\n"
-        "• `netflix 5000 suscripcion`\n\n"
-        "*Foto de ticket:*\nMandá la foto y la leo automáticamente.",
-        parse_mode="Markdown"
-    )
+TEXTO_AYUDA = """👋 *Asistente financiero*
 
-# ── Recibir mensaje de texto ──────────────────────────────────────────────────
+Hablame en lenguaje natural:
+
+💸 *Gastos*
+• "gasté 5000 en uber"
+• "almorcé afuera, pagué 3200"
+• "compré ropa 15000 con visa"
+• [foto de un ticket]
+
+💰 *Ingresos*
+• "cobré el sueldo, 500000"
+• "me pagaron 20000 de extra"
+
+📊 *Consultas*
+• "resumen" — gastos del mes
+• "ingresos" — ingresos del mes
+• "metas" — progreso de tus metas
+• "cuotas" — cuotas activas"""
+
+
 @solo_yo
-async def recibir_texto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(TEXTO_AYUDA, parse_mode="Markdown")
+
+
+@solo_yo
+async def manejar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = update.message.text.strip()
-    if texto.startswith("/"):
-        return
-    
-    concepto, monto, categoria = parsear_texto(texto)
-    
-    if not monto or monto <= 0:
-        await update.message.reply_text(
-            "No pude entender el monto. Probá con:\n*carne 25000* o *super 12500*",
-            parse_mode="Markdown"
-        )
-        return
-    
-    gasto = guardar_gasto(concepto, monto, categoria, fuente="telegram-texto")
-    
-    await update.message.reply_text(
-        f"✅ *Gasto guardado*\n\n"
-        f"📝 {concepto}\n"
-        f"💰 ${monto:,.0f}\n"
-        f"🏷️ {categoria.title()}\n"
-        f"📅 {datetime.now().strftime('%d/%m/%Y')}",
-        parse_mode="Markdown"
-    )
+    texto_lower = texto.lower()
 
-# ── Recibir foto de ticket ────────────────────────────────────────────────────
-@solo_yo
-async def recibir_foto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Leyendo el ticket... un segundo ⏳")
-    
-    foto = update.message.photo[-1]  # la de mayor resolución
-    archivo = await foto.get_file()
-    foto_bytes = await archivo.download_as_bytearray()
-    
+    # Shortcuts directos sin llamar a Claude
+    if texto_lower in ["resumen", "gastos", "/resumen"]:
+        await update.message.reply_text(await obtener_resumen_gastos(), parse_mode="Markdown")
+        return
+    if texto_lower in ["ingresos", "resumen ingresos", "/ingresos"]:
+        await update.message.reply_text(await obtener_resumen_ingresos(), parse_mode="Markdown")
+        return
+    if texto_lower in ["metas", "meta", "/metas"]:
+        await update.message.reply_text(await obtener_metas(), parse_mode="Markdown")
+        return
+    if texto_lower in ["cuotas", "/cuotas"]:
+        await update.message.reply_text(await obtener_cuotas(), parse_mode="Markdown")
+        return
+    if texto_lower in ["ayuda", "/ayuda", "help"]:
+        await update.message.reply_text(TEXTO_AYUDA, parse_mode="Markdown")
+        return
+
+    # Flujo de confirmación pendiente (el usuario está respondiendo con el monto)
+    if context.user_data.get("pendiente"):
+        pendiente = context.user_data.pop("pendiente")
+        try:
+            monto_str = re.sub(r"[^\d.,]", "", texto).replace(",", ".")
+            monto = float(monto_str)
+            pendiente["datos"]["monto"] = monto
+
+            if pendiente["intent"] == "gasto":
+                await registrar_gasto(pendiente["datos"])
+                cat = pendiente["datos"].get("categoria", "otros")
+                await update.message.reply_text(
+                    f"✅ *Gasto guardado*\n{pendiente['datos']['concepto']} — {formatear_monto(monto)}\nCategoría: {cat}",
+                    parse_mode="Markdown"
+                )
+            elif pendiente["intent"] == "ingreso":
+                await registrar_ingreso(pendiente["datos"])
+                await update.message.reply_text(
+                    f"✅ *Ingreso guardado*\n{pendiente['datos']['concepto']} — {formatear_monto(monto)}",
+                    parse_mode="Markdown"
+                )
+            return
+        except (ValueError, KeyError):
+            await update.message.reply_text("No entendí el monto. Mandame solo el número, por ejemplo: 5000")
+            return
+
+    # Parsear con Claude
     try:
-        datos = await parsear_foto(bytes(foto_bytes))
-        concepto  = datos.get("concepto", "Gasto ticket")
-        monto     = float(datos.get("monto", 0))
-        categoria = datos.get("categoria", "otros")
-        items     = datos.get("items", [])
-        
-        if monto <= 0:
+        parsed = await parsear_mensaje(texto)
+    except Exception:
+        await update.message.reply_text("No pude procesar el mensaje. Probá con algo como: \"gasté 5000 en comida\"")
+        return
+
+    intent = parsed.get("intent")
+    datos = parsed.get("datos", {})
+
+    if intent == "gasto":
+        if not datos.get("monto"):
+            context.user_data["pendiente"] = {"intent": "gasto", "datos": datos}
             await update.message.reply_text(
-                "No pude leer el monto del ticket. "
-                "Podés cargarlo manualmente: *nombre monto*",
+                f"_{parsed.get('pregunta', '¿Cuánto fue el monto?')}_",
                 parse_mode="Markdown"
             )
             return
-        
-        guardar_gasto(concepto, monto, categoria, fuente="telegram-foto")
-        
-        items_txt = "\n".join(f"  · {i}" for i in items[:4]) if items else ""
-        msg = (
-            f"✅ *Ticket procesado*\n\n"
-            f"🏪 {concepto}\n"
-            f"💰 ${monto:,.0f}\n"
-            f"🏷️ {categoria.title()}\n"
-        )
-        if items_txt:
-            msg += f"📋 Items:\n{items_txt}\n"
-        msg += f"📅 {datetime.now().strftime('%d/%m/%Y')}"
-        
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    
-    except Exception as e:
+        await registrar_gasto(datos)
         await update.message.reply_text(
-            f"No pude procesar la imagen. Error: {str(e)[:80]}\n"
-            "Intentá mandar el gasto como texto: *nombre monto*",
+            f"✅ *Gasto guardado*\n{datos['concepto']} — {formatear_monto(datos['monto'])}\nCategoría: {datos.get('categoria', 'otros')}",
             parse_mode="Markdown"
         )
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+    elif intent == "ingreso":
+        if not datos.get("monto"):
+            context.user_data["pendiente"] = {"intent": "ingreso", "datos": datos}
+            await update.message.reply_text(
+                f"_{parsed.get('pregunta', '¿Cuánto fue el monto?')}_",
+                parse_mode="Markdown"
+            )
+            return
+        await registrar_ingreso(datos)
+        await update.message.reply_text(
+            f"✅ *Ingreso guardado*\n{datos.get('concepto', 'Ingreso')} — {formatear_monto(datos['monto'])}",
+            parse_mode="Markdown"
+        )
+
+    elif intent == "resumen":
+        await update.message.reply_text(await obtener_resumen_gastos(), parse_mode="Markdown")
+
+    elif intent == "resumen_ingresos":
+        await update.message.reply_text(await obtener_resumen_ingresos(), parse_mode="Markdown")
+
+    elif intent == "metas":
+        await update.message.reply_text(await obtener_metas(), parse_mode="Markdown")
+
+    elif intent == "cuotas":
+        await update.message.reply_text(await obtener_cuotas(), parse_mode="Markdown")
+
+    elif intent == "ayuda":
+        await update.message.reply_text(TEXTO_AYUDA, parse_mode="Markdown")
+
+    else:
+        await update.message.reply_text(
+            "No entendí bien. Podés decirme cosas como:\n• \"gasté 3000 en nafta\"\n• \"cobré 200000\"\n• \"resumen\" / \"metas\" / \"cuotas\""
+        )
+
+
+@solo_yo
+async def manejar_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Analizando el ticket...")
+
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    image_data = bytes(await file.download_as_bytearray())
+
+    try:
+        gastos = await analizar_foto(image_data)
+    except Exception:
+        await update.message.reply_text("No pude leer el ticket. Intentá con una foto más nítida.")
+        return
+
+    if not gastos:
+        await update.message.reply_text("No encontré gastos en la imagen.")
+        return
+
+    guardados = []
+    for g in gastos:
+        try:
+            await registrar_gasto(g)
+            guardados.append(g)
+        except Exception:
+            pass
+
+    if not guardados:
+        await update.message.reply_text("Encontré gastos pero no pude guardarlos.")
+        return
+
+    texto = "✅ *Ticket procesado*\n\n"
+    for g in guardados:
+        texto += f"• {g['concepto']}: {formatear_monto(g['monto'])} ({g['categoria']})\n"
+
+    await update.message.reply_text(texto, parse_mode="Markdown")
+
+
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("resumen", cmd_resumen))
-    app.add_handler(CommandHandler("ayuda",   cmd_ayuda))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_texto))
-    app.add_handler(MessageHandler(filters.PHOTO, recibir_foto))
-    print("Bot corriendo...")
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("ayuda", cmd_start))
+    app.add_handler(CommandHandler("resumen", manejar_texto))
+    app.add_handler(CommandHandler("metas", manejar_texto))
+    app.add_handler(CommandHandler("cuotas", manejar_texto))
+    app.add_handler(CommandHandler("ingresos", manejar_texto))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_texto))
+    app.add_handler(MessageHandler(filters.PHOTO, manejar_foto))
+    print("Bot iniciado...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
