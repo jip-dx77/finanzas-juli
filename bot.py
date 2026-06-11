@@ -89,7 +89,7 @@ Si el intent es ambiguo entre gasto e ingreso → pedí aclaración.
 Siempre inferí la categoría aunque no sea explícita, usando el contexto."""
 
     response = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-3-5-haiku-20241022",
         max_tokens=500,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -237,7 +237,7 @@ Reglas:
 - No incluyas propinas ni items con monto 0."""
 
     response = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-3-5-haiku-20241022",
         max_tokens=1000,
         messages=[{
             "role": "user",
@@ -332,8 +332,8 @@ async def manejar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Parsear con Claude
     try:
         parsed = await parsear_mensaje(texto)
-    except Exception:
-        await update.message.reply_text("No pude procesar el mensaje. Probá con algo como: \"gasté 5000 en comida\"")
+    except Exception as e:
+        await update.message.reply_text(f"Error al procesar: {e}")
         return
 
     intent = parsed.get("intent")
