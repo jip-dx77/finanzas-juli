@@ -2,10 +2,12 @@ import os
 import json
 import base64
 import re
+import asyncio
 from datetime import datetime, date
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import Conflict
 from supabase import create_client, Client
 import anthropic
 
@@ -425,6 +427,14 @@ async def manejar_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(texto, parse_mode="Markdown")
 
 
+async def manejar_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    if isinstance(context.error, Conflict):
+        print("Conflict: otra instancia corriendo, esperando...")
+        await asyncio.sleep(3)
+        return
+    print(f"Error: {context.error}")
+
+
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -435,6 +445,7 @@ def main():
     app.add_handler(CommandHandler("ingresos", manejar_texto))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_texto))
     app.add_handler(MessageHandler(filters.PHOTO, manejar_foto))
+    app.add_error_handler(manejar_error)
     print("Bot iniciado...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
